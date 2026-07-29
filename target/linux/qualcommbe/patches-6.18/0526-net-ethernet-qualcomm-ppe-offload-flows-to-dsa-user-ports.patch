@@ -17,10 +17,12 @@ source-MAC rewrite and MY_MAC entry land where the reverse direction
 ingresses.
 
 Resolve ingress from a DSA user port to the conduit and classify its
-standalone VID through the existing VLAN-uplink machinery. This makes
-the hardware lookup key match packets before the DSA receive path
-removes the tag. Keep a reference to a DSA egress netdev so its carrier,
-rather than only the conduit's, controls flow activity reporting.
+active tag_8021q VID through the existing VLAN-uplink machinery. This is
+the standalone VID for a standalone port and the bridge VID after a port
+joins a VLAN-unaware bridge. It makes the hardware lookup key match
+packets before the DSA receive path removes the tag. Use the same VID for
+egress, and keep a reference to the DSA netdev so carrier loss or a VID
+change stops refreshing a flow which can no longer deliver packets.
 
 Ports under a proprietary tagger stay rejected, as do DSA flows that
 already carry a user VLAN: the hardware path exposed by this driver has
@@ -39,61 +41,75 @@ Signed-off-by: Akshay Kakatkar <me@kakatkarakshay.dev>
  #include <linux/etherdevice.h>
  #include <linux/hashtable.h>
  #include <linux/if_arp.h>
-@@ -161,5 +162,6 @@
+@@ -161,5 +162,7 @@
   * @vlan: VLAN uplink slot held by the flow, negative when none.
   * @eport: Egress PPE port of the flow.
-+ * @egress_dev: DSA user netdev held for carrier checks.
++ * @egress_dev: DSA user netdev held for carrier and topology checks.
++ * @egress_vid: tag_8021q VID programmed for DSA egress.
   * @packets: Hit packet count at the last stats read.
   * @bytes: Hit byte count at the last stats read.
   */
-@@ -182,6 +184,7 @@ struct ppe_ft_flow {
+@@ -181,6 +184,8 @@ struct ppe_ft_flow {
  	int ivp;
  	struct ppe_vp_flow vp_flow;
  	u8 eport;
 +	struct net_device *egress_dev;
++	u16 egress_vid;
  	u32 packets;
  	u64 bytes;
  };
-@@ -1776,6 +1777,30 @@
+@@ -1778,6 +1783,42 @@
  			flow->index, ret);
  
  	list_add_tail(&flow->zombie_node, &ft->zombies);
 +}
 +
-+/* A DSA user port behind a PPE conduit is reachable only with a
-+ * tag_8021q tagger whose standalone VID the PPE can match or push.
-+ * A proprietary tagger's header is not something the PPE can handle.
-+ */
-+static struct dsa_port *ppe_ft_dsa_port(struct net_device *dev)
++static void ppe_ft_flow_release(struct ppe_ft_flow *flow)
++{
++	if (flow->egress_dev)
++		dev_put(flow->egress_dev);
++	kfree(flow);
++}
++
++static int ppe_ft_dsa_port(struct net_device *dev, struct dsa_port **dpp)
 +{
 +	struct dsa_port *dp;
 +
-+	if (!dsa_user_dev_check(dev))
-+		return NULL;
++	if (!dev || !dsa_user_dev_check(dev))
++		return -EOPNOTSUPP;
 +
 +	dp = dsa_port_from_netdev(dev);
 +	if (IS_ERR(dp))
-+		return NULL;
++		return PTR_ERR(dp);
 +
 +	if (dp->cpu_dp->tag_ops->proto != DSA_TAG_PROTO_VSC73XX_8021Q)
-+		return NULL;
++		return -EOPNOTSUPP;
 +
 +	if (!edma_port_dev_check(dsa_port_to_conduit(dp)))
-+		return NULL;
++		return -EOPNOTSUPP;
 +
-+	return dp;
++	if (dsa_port_is_vlan_filtering(dp))
++		return -EOPNOTSUPP;
++
++	if (dpp)
++		*dpp = dp;
++
++	if (dsa_port_bridge_dev_get(dp))
++		return dsa_tag_8021q_bridge_vid(dsa_port_bridge_num_get(dp));
++
++	return dsa_tag_8021q_standalone_vid(dp);
  }
  
  static int ppe_ft_flow_replace(struct ppe_flowtable *ft,
-@@ -2147,6 +2171,7 @@
+@@ -2147,6 +2181,7 @@
  	}
  	reject_reason = PPE_FT_REJECT_OUTPUT_DEVICE;
  	if (!tunnel_encap && !edma_port_dev_check(odev) &&
-+	    !ppe_ft_dsa_port(odev) &&
++	    ppe_ft_dsa_port(odev, NULL) < 0 &&
  	    (!ft->ppe_dev->variant->has_vports ||
  	     odev->type != ARPHRD_ETHER || !odev->ieee80211_ptr)) {
  		ret = -EOPNOTSUPP;
-@@ -2194,6 +2221,7 @@
+@@ -2169,6 +2204,7 @@
  	 */
  	if (data.ingress_ifindex) {
  		struct net_device *idev;
@@ -101,14 +117,19 @@ Signed-off-by: Akshay Kakatkar <me@kakatkarakshay.dev>
  		struct net_device *master;
  		int vp_ret = 0;
  
-@@ -2219,5 +2247,23 @@
+@@ -2194,5 +2230,28 @@
  
  			iport = ipriv->ppe_port->port_id;
-+		} else if (ppe_ft_dsa_port(idev)) {
++		} else if (dsa_user_dev_check(idev)) {
 +			struct net_device *conduit;
 +			struct edma_port_priv *ipriv;
++			int dsa_ivid;
 +
-+			dp = ppe_ft_dsa_port(idev);
++			dsa_ivid = ppe_ft_dsa_port(idev, &dp);
++			if (dsa_ivid < 0) {
++				vp_ret = dsa_ivid;
++				goto put_idev;
++			}
 +			conduit = dsa_port_to_conduit(dp);
 +
 +			/* The parser exposes one VLAN layer. A user VLAN inside
@@ -121,11 +142,11 @@ Signed-off-by: Akshay Kakatkar <me@kakatkarakshay.dev>
 +
 +			ipriv = netdev_priv(conduit);
 +			iport = ipriv->ppe_port->port_id;
-+			data.ingress_vid = dsa_tag_8021q_standalone_vid(dp);
++			data.ingress_vid = dsa_ivid;
  		} else if (ft->ppe_dev->variant->has_vports &&
  			   idev->type == ARPHRD_ETHER && idev->ieee80211_ptr) {
  			reject_reason = PPE_FT_REJECT_INGRESS_VP;
-@@ -2226,6 +2269,7 @@
+@@ -2201,6 +2260,7 @@
  			if (vp_ret >= 0)
  				flow->ivp = vp_ret;
  		}
@@ -133,12 +154,13 @@ Signed-off-by: Akshay Kakatkar <me@kakatkarakshay.dev>
  		dev_put(idev);
  
  		if (vp_ret < 0) {
-@@ -2220,6 +2245,23 @@
+@@ -2220,6 +2280,30 @@
  			port_priv = netdev_priv(odev);
  			nh.port = port_priv->ppe_port->port_id;
  			nh.l3_if = nh.port;
-+		} else if (ppe_ft_dsa_port(odev)) {
-+			struct dsa_port *dp = ppe_ft_dsa_port(odev);
++		} else if (dsa_user_dev_check(odev)) {
++			struct dsa_port *dp;
++			int dsa_ovid;
 +
 +			/* The next hop pushes one tag; a switch port
 +			 * with tagged bridge-vlan egress would need
@@ -148,16 +170,22 @@ Signed-off-by: Akshay Kakatkar <me@kakatkarakshay.dev>
 +				ret = -EOPNOTSUPP;
 +				goto err_prelock_ivp;
 +			}
++			dsa_ovid = ppe_ft_dsa_port(odev, &dp);
++			if (dsa_ovid < 0) {
++				ret = dsa_ovid;
++				goto err_prelock_ivp;
++			}
 +			port_priv = netdev_priv(dsa_port_to_conduit(dp));
 +			nh.port = port_priv->ppe_port->port_id;
 +			nh.l3_if = nh.port;
-+			nh.vid = dsa_tag_8021q_standalone_vid(dp);
++			nh.vid = dsa_ovid;
 +			flow->egress_dev = odev;
++			flow->egress_vid = dsa_ovid;
 +			dev_hold(flow->egress_dev);
  		} else {
  			ret = ppe_vp_get(ft->ppe_dev, odev,
  					 f->common.prio);
-@@ -2572,6 +2614,8 @@
+@@ -2556,6 +2640,8 @@
  err_free:
  	if (ret)
  		atomic_long_inc(&ft->rejects[reject_reason]);
@@ -166,7 +194,7 @@ Signed-off-by: Akshay Kakatkar <me@kakatkarakshay.dev>
  	kfree_rcu(flow, rcu);
  
  	return ret;
-@@ -2608,6 +2652,8 @@ static int ppe_ft_flow_destroy(struct pp
+@@ -2588,6 +2674,8 @@ static int ppe_ft_flow_destroy(struct pp
  		ppe_ft_tunnel_put(ft, flow->tunnel);
  		ppe_vp_put(ft->ppe_dev, flow->vp);
  		ppe_vp_put(ft->ppe_dev, flow->ivp);
@@ -175,11 +203,13 @@ Signed-off-by: Akshay Kakatkar <me@kakatkarakshay.dev>
  	} else {
  		ppe_ft_flow_quarantine(ft, flow);
  		flow = NULL;
-@@ -2681,6 +2726,11 @@ static int ppe_ft_flow_stats(struct ppe_
+@@ -2654,6 +2742,13 @@ static int ppe_ft_flow_stats(struct ppe_
  		return -ENOENT;
  	}
  
-+	if (flow->egress_dev && !netif_carrier_ok(flow->egress_dev)) {
++	if (flow->egress_dev &&
++	    (!netif_carrier_ok(flow->egress_dev) ||
++	     ppe_ft_dsa_port(flow->egress_dev, NULL) != flow->egress_vid)) {
 +		rcu_read_unlock();
 +		return 0;
 +	}
@@ -187,25 +217,10 @@ Signed-off-by: Akshay Kakatkar <me@kakatkarakshay.dev>
  	/* Hardware-forwarded packets never revalidate the route in
  	 * software, and the hit counter of a flow counts at ingress
  	 * lookup whether or not egress delivery still works: a flow
-@@ -3481,9 +3531,16 @@ int ppe_flowtable_setup(struct ppe_devic
- 	rtnl_unlock();
- 
- 	return 0;
- }
- 
-+static void ppe_ft_flow_release(struct ppe_ft_flow *flow)
-+{
-+	if (flow->egress_dev)
-+		dev_put(flow->egress_dev);
-+	kfree(flow);
-+}
-+
- static void ppe_ft_flow_free(void *ptr, void *arg)
- {
+@@ -3488 +3590 @@ static void ppe_ft_flow_free(void *ptr, void *arg)
 -	kfree(ptr);
 +	ppe_ft_flow_release(ptr);
- }
-@@ -3482,5 +3494,5 @@ void ppe_flowtable_destroy(struct ppe_de
+@@ -3528,5 +3630,5 @@ void ppe_flowtable_destroy(struct ppe_de
  	rhashtable_free_and_destroy(&ft->flows, ppe_ft_flow_free, NULL);
  	list_for_each_entry_safe(flow, flow_tmp, &ft->zombies, zombie_node) {
  		list_del(&flow->zombie_node);
