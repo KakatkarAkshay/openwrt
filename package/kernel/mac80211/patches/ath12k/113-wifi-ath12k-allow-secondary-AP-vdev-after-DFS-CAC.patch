@@ -1,0 +1,42 @@
+From: Akshay Kakatkar <me@kakatkarakshay.dev>
+Date: Wed, 29 Jul 2026 17:05:58 +0530
+Subject: [PATCH] wifi: ath12k: allow secondary AP vdev after DFS CAC
+
+ath12k marks every AP vdev start on a radar channel as passive. This is
+correct while the channel is in DFS_USABLE state and CAC is still required,
+but not after CAC has changed the channel to DFS_AVAILABLE.
+
+This matters when multiple AP BSSes share a channel context. mac80211 starts
+the first BSS after CAC, then starts each additional BSS vdev in turn. The
+firmware rejects the later passive vdev start while the radio is already
+beaconing, causing NL80211_CMD_START_AP to fail.
+
+Set the passive flag for a radar channel only while CAC is required. Keep the
+DFS flags unchanged so radar detection remains enabled on the channel context,
+and preserve NO_IR handling for non-radar channels.
+
+Signed-off-by: Akshay Kakatkar <me@kakatkarakshay.dev>
+---
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -10628,7 +10628,8 @@ ath12k_mac_vdev_start_restart(struct ath
+ 
+ 		arg.freq2_radar = ctx->radar_enabled;
+ 
+-		arg.passive = arg.chan_radar;
++		arg.passive = arg.chan_radar &&
++			cfg80211_chandef_dfs_usable(hw->wiphy, chandef);
+ 
+ 		spin_lock_bh(&ab->base_lock);
+ 		arg.regdomain = ar->ab->dfs_region;
+@@ -10637,7 +10639,8 @@ ath12k_mac_vdev_start_restart(struct ath
+ 		/* TODO: Notify if secondary 80Mhz also needs radar detection */
+ 	}
+ 
+-	arg.passive |= !!(chandef->chan->flags & IEEE80211_CHAN_NO_IR);
++	if (!arg.chan_radar)
++		arg.passive = !!(chandef->chan->flags & IEEE80211_CHAN_NO_IR);
+ 
+ 	if (!restart)
+ 		ath12k_mac_mlo_get_vdev_args(arvif, &arg.ml);
