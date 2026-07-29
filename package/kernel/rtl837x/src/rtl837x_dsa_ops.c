@@ -850,6 +850,36 @@ static int rtl837x_port_fdb_del(struct dsa_switch *ds, int port,
 	return rtl837x_to_errno(ret);
 }
 
+static int rtl837x_port_fdb_dump(struct dsa_switch *ds, int port,
+				dsa_fdb_dump_cb_t *cb, void *data)
+{
+	struct rtk_gsw *gsw = ds->priv;
+	rtk_l2_ucastAddr_t l2;
+	u32 address = 0;
+	int ret;
+
+	if (!rtl837x_valid_port(gsw, port))
+		return -EINVAL;
+
+	while (address <= RTK_MAX_LUT_ADDR_ID) {
+		ret = rtk_l2_addr_next_get(READMETHOD_NEXT_L2UCSPA, port,
+					   &address, &l2);
+		if (ret == RT_ERR_L2_ENTRY_NOTFOUND)
+			return 0;
+		if (ret)
+			return rtl837x_to_errno(ret);
+
+		ret = cb(l2.mac.octet, l2.ivl ? l2.vid_fid : 0,
+			 l2.is_static, data);
+		if (ret)
+			return ret;
+
+		address++;
+	}
+
+	return 0;
+}
+
 static const struct dsa_switch_ops rtl837x_dsa_ops = {
 	.get_tag_protocol = rtl837x_get_tag_protocol,
 	.setup = rtl837x_setup,
@@ -871,6 +901,7 @@ static const struct dsa_switch_ops rtl837x_dsa_ops = {
 	.port_vlan_del = rtl837x_port_vlan_del,
 	.port_fdb_add = rtl837x_port_fdb_add,
 	.port_fdb_del = rtl837x_port_fdb_del,
+	.port_fdb_dump = rtl837x_port_fdb_dump,
 	.tag_8021q_vlan_add = rtl837x_tag_8021q_vlan_add,
 	.tag_8021q_vlan_del = rtl837x_tag_8021q_vlan_del,
 };
