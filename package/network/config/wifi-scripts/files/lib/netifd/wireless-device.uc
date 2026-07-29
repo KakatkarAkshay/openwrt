@@ -416,10 +416,7 @@ function start()
 
 function retry_setup()
 {
-	if (this.delete)
-		return;
-
-	if (this.state != "down" || !this.autostart)
+	if (this.delete || !this.autostart)
 		return;
 
 	this.start();
