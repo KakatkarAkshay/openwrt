@@ -1,0 +1,52 @@
+From: Akshay Kakatkar <me@kakatkarakshay.dev>
+Date: Wed, 29 Jul 2026 16:00:00 +0530
+Subject: [PATCH] remoteproc: qcom: wcss: copy coredump before recovery
+
+The secure WCSS PIL driver selects inline coredumps. The remoteproc core
+waits for an inline dump to be consumed, or for devcoredump's five minute
+timeout, before it reloads the crashed remote processor. This leaves every
+ath12k device in the WSI group unavailable long after q6wcss crashes.
+
+Use the copied coredump mode instead. It snapshots the WCSS regions while
+the remote processor is stopped, then allows recovery to continue without
+depending on a userspace dump reader.
+
+Also copy the final chunk before releasing its temporary mapping. A full
+segment copy has offset plus size equal to the segment size, so the old
+condition unmapped the segment without copying any data. This ordering
+matches Qualcomm's downstream secure WCSS driver.
+
+This follows the recovery lifecycle of the upstream remoteproc core while
+retaining the dump regions added by the secure PIL driver.
+
+Link: https://lore.kernel.org/r/20260713-rproc-v13-3-41011cbcda3e@oss.qualcomm.com
+Link: https://github.com/Telecominfraproject/wlan-ap/blob/4dda11dcf7455828e03a753079c520701f2f7a7c/feeds/qca-wifi-7/ipq53xx/files-6.6/drivers/remoteproc/qcom_q6v5_wcss_sec.c
+Signed-off-by: Akshay Kakatkar <me@kakatkarakshay.dev>
+---
+ drivers/remoteproc/qcom_q6v5_wcss_sec.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+--- a/drivers/remoteproc/qcom_q6v5_wcss_sec.c
++++ b/drivers/remoteproc/qcom_q6v5_wcss_sec.c
+@@ -137,9 +137,9 @@ static void wcss_sec_copy_segment(struct
+ 		return;
+ }
+ 
+-	if (offset + size < segment->size) {
+-		memcpy(dest, segment->io_ptr + offset, size);
+-	} else {
++	memcpy(dest, segment->io_ptr + offset, size);
++
++	if (offset + size >= segment->size) {
+ 		iounmap(segment->io_ptr);
+ 		segment->io_ptr = NULL;
+ }
+@@ -271,7 +272,7 @@ static int wcss_sec_probe(struct platform
+ }
+ 
+ 	rproc->auto_boot = false;
+-	rproc->dump_conf = RPROC_COREDUMP_INLINE;
++	rproc->dump_conf = RPROC_COREDUMP_ENABLED;
+ 	rproc_coredump_set_elf_info(rproc, ELFCLASS32, EM_NONE);
+ 
+ 	ret = devm_rproc_add(&pdev->dev, rproc);
