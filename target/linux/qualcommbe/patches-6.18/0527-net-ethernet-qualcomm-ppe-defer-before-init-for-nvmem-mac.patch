@@ -1,0 +1,73 @@
+From: Akshay Kakatkar <me@kakatkarakshay.dev>
+Date: Wed, 29 Jul 2026 21:00:00 +0530
+Subject: [PATCH] net: ethernet: qualcomm: ppe: defer before init for NVMEM MAC
+
+Ethernet port MAC addresses may be provided by an eMMC-backed NVMEM
+provider which is not ready when the PPE platform device first probes.
+The port setup currently converts -EPROBE_DEFER to a random address.
+
+Check the port MAC addresses before initializing PPE hardware. This keeps
+probe deferral ahead of the PPE reset and EDMA setup, which cannot safely be
+repeated after a partially initialized probe. Preserve the existing random
+fallback for missing or invalid addresses.
+
+Signed-off-by: Akshay Kakatkar <me@kakatkarakshay.dev>
+---
+ drivers/net/ethernet/qualcomm/ppe/ppe.c | 32 +++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c
+@@ -11,6 +11,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_device.h>
++#include <linux/of_net.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+ #include <linux/reset.h>
+@@ -202,6 +203,32 @@ static int ppe_clock_init_and_reset(stru
+ 	return reset_control_deassert(rstc);
+ }
+ 
++static int ppe_port_mac_nvmem_ready(struct device *dev)
++{
++	struct device_node *ports_node, *port_node;
++	u8 mac_addr[ETH_ALEN];
++	int ret = 0;
++
++	ports_node = of_get_child_by_name(dev->of_node, "ethernet-ports");
++	if (!ports_node)
++		return 0;
++
++	for_each_available_child_of_node(ports_node, port_node) {
++		ret = of_get_mac_address(port_node, mac_addr);
++		if (ret == -EPROBE_DEFER) {
++			of_node_put(port_node);
++			break;
++		}
++	}
++
++	of_node_put(ports_node);
++
++	if (ret == -EPROBE_DEFER)
++		return ret;
++
++	return 0;
++}
++
+ static int qcom_ppe_probe(struct platform_device *pdev)
+ {
+ 	const struct icc_bulk_data *ppe_icc_data;
+@@ -210,6 +237,11 @@ static int qcom_ppe_probe(struct platfor
+ 	struct ppe_device *ppe_dev;
+ 	void __iomem *base;
+ 
++	ret = ppe_port_mac_nvmem_ready(dev);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "PPE port MAC address provider not ready\n");
++
+ 	if (of_device_is_compatible(dev->of_node, "qcom,ipq5332-ppe")) {
+ 		ppe_icc_data = ipq5332_icc_data;
+ 		num_icc = ARRAY_SIZE(ipq5332_icc_data);
