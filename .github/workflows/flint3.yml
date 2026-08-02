@@ -1,0 +1,232 @@
+name: Flint 3
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - gl-be9300
+  schedule:
+    - cron: '0 0 * * *'
+
+concurrency:
+  group: flint3-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FEED_HOST: https://feeds.kakatkarakshay.dev
+  R2_PREFIX: targets/qualcommbe/ipq53xx/packages
+
+jobs:
+  tag:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: gl-be9300
+          fetch-depth: 0
+
+      - id: tag
+        run: |
+          if [ -z "$(git log --since='24 hours ago' --format=%h)" ]; then
+            echo "No commits in the last 24 hours, nothing to release"
+            exit 0
+          fi
+
+          tag="$(date -u -d '1 day ago' +%Y.%m.%d)"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "Tag $tag already exists, nothing to release"
+            exit 0
+          fi
+
+          git tag "$tag"
+          git push origin "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: tag
+    if: >-
+      !cancelled() && needs.tag.result != 'failure' &&
+      (github.event_name != 'schedule' || needs.tag.outputs.tag != '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-setuptools rsync swig \
+            unzip zlib1g-dev file wget zstd python3-distutils-extra
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Point the target package feed at ${{ env.FEED_HOST }}
+        run: |
+          sed -i "s|%U/targets/%S/packages/packages.adb|$FEED_HOST/targets/%S/packages/packages.adb|" \
+            include/feeds.mk
+          git --no-pager diff --stat include/feeds.mk
+
+      - name: Restore APK signing key
+        env:
+          APK_PRIVATE_KEY: ${{ secrets.APK_PRIVATE_KEY }}
+          APK_PUBLIC_KEY: ${{ vars.APK_PUBLIC_KEY }}
+        run: |
+          if [ -z "$APK_PRIVATE_KEY" ] || [ -z "$APK_PUBLIC_KEY" ]; then
+            echo "::error::APK key material is unset; a fresh key would break trust for already-flashed devices"
+            exit 1
+          fi
+          printf '%s\n' "$APK_PRIVATE_KEY" > private-key.pem
+          printf '%s\n' "$APK_PUBLIC_KEY" > public-key.pem
+          chmod 600 private-key.pem
+          openssl ec -in private-key.pem -pubout | diff -q - public-key.pem
+
+      - name: Update and install feeds
+        run: |
+          for attempt in 1 2 3 4; do
+            ./scripts/feeds update -a && break
+            if [ "$attempt" = 4 ]; then
+              echo "::error::feeds update failed after 4 attempts"
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
+          ./scripts/feeds install -a
+
+      - name: Configure
+        run: |
+          cat > .config <<'EOF'
+          CONFIG_TARGET_qualcommbe=y
+          CONFIG_TARGET_qualcommbe_ipq53xx=y
+          CONFIG_TARGET_qualcommbe_ipq53xx_DEVICE_glinet_gl-be9300=y
+          CONFIG_SIGNED_PACKAGES=y
+          CONFIG_SIGNATURE_CHECK=y
+          CONFIG_USE_APK=y
+          CONFIG_PER_FEED_REPO=y
+          EOF
+          make defconfig
+          grep -Fq 'CONFIG_TARGET_qualcommbe_ipq53xx_DEVICE_glinet_gl-be9300=y' .config
+          grep -Fq 'CONFIG_USE_APK=y' .config
+          grep -Fq 'CONFIG_SIGNED_PACKAGES=y' .config
+          grep -Fq 'CONFIG_PER_FEED_REPO=y' .config
+
+      - name: Cache downloads
+        uses: actions/cache@v6
+        with:
+          path: dl
+          key: dl-ipq53xx-${{ github.sha }}
+          restore-keys: dl-ipq53xx-
+
+      - name: Download sources
+        run: make download -j8
+
+      - name: Build
+        run: make -j"$(nproc)" || make -j1 V=s
+
+      - name: Show what will be published
+        run: |
+          ls -l bin/targets/qualcommbe/ipq53xx/packages/
+          du -sh bin/targets/qualcommbe/ipq53xx/packages/
+
+      - name: Publish feed to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: ${{ secrets.R2_URL }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+        run: |
+          aws s3 sync bin/targets/qualcommbe/ipq53xx/packages/ \
+            "s3://$R2_BUCKET/$R2_PREFIX/" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --exclude 'packages.adb' \
+            --exclude 'index.json' \
+            --no-progress
+          aws s3 cp bin/targets/qualcommbe/ipq53xx/packages/packages.adb \
+            "s3://$R2_BUCKET/$R2_PREFIX/packages.adb" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --cache-control 'no-cache' \
+            --no-progress
+          aws s3 cp bin/targets/qualcommbe/ipq53xx/packages/index.json \
+            "s3://$R2_BUCKET/$R2_PREFIX/index.json" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --cache-control 'no-cache' \
+            --no-progress
+
+      - name: Collect changes since the previous release
+        if: needs.tag.outputs.tag != ''
+        id: changes
+        run: |
+          previous="$(git describe --tags --abbrev=0 \
+            --match '[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]' HEAD^ 2>/dev/null || true)"
+          {
+            echo 'log<<CHANGES_EOF'
+            git log --first-parent --format='%h %s' ${previous:+"$previous..HEAD"} -n 200
+            echo 'CHANGES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Draft release notes
+        if: needs.tag.outputs.tag != ''
+        id: notes
+        continue-on-error: true
+        uses: openai/codex-action@v1.11
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          responses-api-endpoint: ${{ secrets.CODEX_BASE_URL }}
+          model: ${{ vars.CODEX_MODEL }}
+          permission-profile: ':read-only'
+          prompt: |
+            Write release notes for OpenWrt firmware ${{ needs.tag.outputs.tag }} for the
+            GL.iNet GL-BE9300 (Flint 3), built from this repository.
+
+            Commits since the previous release:
+            ${{ steps.changes.outputs.log }}
+
+            Read the repository where a commit subject alone is unclear. Open with a one-line
+            summary, then grouped bullets. Describe only what these commits changed; do not
+            invent changes and do not speculate about untested behaviour.
+
+      - name: Publish release
+        if: needs.tag.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.tag.outputs.tag }}
+          NOTES: ${{ steps.notes.outputs.final-message }}
+        working-directory: bin/targets/qualcommbe/ipq53xx
+        run: |
+          factory="$(find . -maxdepth 1 -name '*gl-be9300*factory*.bin' -print -quit)"
+          sysupgrade="$(find . -maxdepth 1 -name '*gl-be9300*sysupgrade*.bin' -print -quit)"
+          test -s "$factory" && test -s "$sysupgrade"
+          sha256sum "$factory" "$sysupgrade" > SHA256SUMS
+
+          if [ -n "$NOTES" ]; then
+            printf '%s\n' "$NOTES" > notes.md
+          else
+            cat version.buildinfo > notes.md
+          fi
+
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file notes.md \
+            --generate-notes \
+            "$factory" "$sysupgrade" SHA256SUMS
+
+      - name: Upload images
+        uses: actions/upload-artifact@v7
+        with:
+          name: gl-be9300-images
+          path: |
+            bin/targets/qualcommbe/ipq53xx/*.bin
+            bin/targets/qualcommbe/ipq53xx/*.itb
+            bin/targets/qualcommbe/ipq53xx/*.manifest
+            bin/targets/qualcommbe/ipq53xx/sha256sums
+          if-no-files-found: warn
