@@ -475,7 +475,8 @@
 	status = "okay";
 };
 
-&usb_dwc {
+&usb {
+	qcom,multiplexed-phy;
 	status = "okay";
 };
 
