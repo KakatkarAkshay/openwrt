@@ -104,20 +104,14 @@ jobs:
 
       - name: Configure
         run: |
-          cat > .config <<'EOF'
-          CONFIG_TARGET_qualcommbe=y
-          CONFIG_TARGET_qualcommbe_ipq53xx=y
-          CONFIG_TARGET_qualcommbe_ipq53xx_DEVICE_glinet_gl-be9300=y
-          CONFIG_SIGNED_PACKAGES=y
-          CONFIG_SIGNATURE_CHECK=y
-          CONFIG_USE_APK=y
-          CONFIG_PER_FEED_REPO=y
-          EOF
+          cp configs/router.config .config
           make defconfig
-          grep -Fq 'CONFIG_TARGET_qualcommbe_ipq53xx_DEVICE_glinet_gl-be9300=y' .config
-          grep -Fq 'CONFIG_USE_APK=y' .config
-          grep -Fq 'CONFIG_SIGNED_PACKAGES=y' .config
-          grep -Fq 'CONFIG_PER_FEED_REPO=y' .config
+
+          missing=0
+          while read -r sym; do
+            grep -Fqx "$sym" .config || { echo "::error::$sym missing after defconfig"; missing=1; }
+          done < <(grep -v '^#' configs/router.config | grep .)
+          [ "$missing" = 0 ]
 
       - name: Cache downloads
         uses: actions/cache@v6
