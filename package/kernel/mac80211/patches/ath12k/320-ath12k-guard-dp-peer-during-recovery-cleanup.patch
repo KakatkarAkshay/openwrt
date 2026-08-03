@@ -1,0 +1,39 @@
+From: Harsh Kumar Bijlani <hbijlani@qti.qualcomm.com>
+Date: Wed, 17 Sep 2025 10:54:25 +0530
+Subject: [PATCH] wifi: ath12k: guard dp peer during recovery cleanup
+
+Firmware recovery can interrupt peer setup after the link peer is added to
+the datapath list but before its shared dp_peer is assigned. The recovery
+cleanup already accounts for this when releasing RX TID state, but then
+unconditionally dereferences the same NULL pointer while unlinking it.
+
+Only clear the shared peer links when dp_peer is present. The link peer is
+still removed from its hash and list in either case.
+
+Adapted from Qualcomm's downstream dp_peer NULL checks.
+
+Signed-off-by: Harsh Kumar Bijlani <hbijlani@qti.qualcomm.com>
+Signed-off-by: JiaY-shi <shi05275@163.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -1237,11 +1237,13 @@ void ath12k_mac_peer_cleanup_all(struct
+ 
+ 		/* cleanup dp peer */
+ 		spin_lock_bh(&dp_hw->peer_lock);
+-		dp_peer = peer->dp_peer;
+-		peerid_index = ath12k_dp_peer_get_peerid_index(dp, peer->peer_id);
+-		rcu_assign_pointer(dp_peer->link_peers[peer->link_id], NULL);
+-		rcu_assign_pointer(dp_hw->dp_peers[peerid_index], NULL);
++		if (peer->dp_peer) {
++			dp_peer = peer->dp_peer;
++			peerid_index = ath12k_dp_peer_get_peerid_index(dp, peer->peer_id);
++			rcu_assign_pointer(dp_peer->link_peers[peer->link_id], NULL);
++			rcu_assign_pointer(dp_hw->dp_peers[peerid_index], NULL);
++		}
+ 		spin_unlock_bh(&dp_hw->peer_lock);
+ 
+ 		ath12k_dp_link_peer_rhash_delete(dp, peer);
