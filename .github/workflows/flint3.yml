@@ -200,7 +200,6 @@ jobs:
           factory="$(find . -maxdepth 1 -name '*gl-be9300*factory*.bin' -print -quit)"
           sysupgrade="$(find . -maxdepth 1 -name '*gl-be9300*sysupgrade*.bin' -print -quit)"
           test -s "$factory" && test -s "$sysupgrade"
-          sha256sum "$factory" "$sysupgrade" > SHA256SUMS
 
           if [ -n "$NOTES" ]; then
             printf '%s\n' "$NOTES" > notes.md
@@ -212,7 +211,7 @@ jobs:
             --title "$TAG" \
             --notes-file notes.md \
             --generate-notes \
-            "$factory" "$sysupgrade" SHA256SUMS
+            "$factory" "$sysupgrade"
 
       - name: Upload images
         uses: actions/upload-artifact@v7
