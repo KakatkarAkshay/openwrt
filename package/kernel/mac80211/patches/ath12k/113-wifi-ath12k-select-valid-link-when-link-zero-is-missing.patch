@@ -1,33 +1,38 @@
 From: Akshay Kakatkar <me@kakatkarakshay.dev>
 Date: Wed, 29 Jul 2026 12:00:00 +0530
-Subject: [PATCH] wifi: ath12k: select valid link when link zero is missing
+Subject: [PATCH] wifi: ath12k: select valid link for MLO multicast offload
 
-The TX control link field can contain zero for MLD frames even when link
-zero is not part of the VIF. ath12k treats that value as an explicit link,
-fails to find an arvif and drops the frame.
+mac80211 leaves the MLO link field at zero for hardware-encapsulated
+802.3 frames because the field is not used for those frames. For multicast
+offload, the TX path also has no STA, so ath12k_mac_get_tx_link() treats
+zero as an explicit link ID and returns it unchanged.
 
-Select the first driver-backed active link when the VIF does not have link
-zero. The existing TX link selection can still apply STA-specific policy.
+When an AP MLD does not contain link zero, ath12k consequently fails to
+resolve ahvif->link[0] and drops the frame before multicast replication.
 
-Intersect active_links with links_map so that this does not redirect frames
-to links which are being removed. If no active driver link remains, retain
-the existing teardown behavior and drop the frame.
+For a hardware-encapsulated frame without a STA, select the first
+driver-backed valid link when zero is not valid. This initial link only
+provides a valid arvif; the multicast path still replicates the frame using
+each link's own arvif. If no driver-backed valid link remains, retain the
+existing behavior and drop the frame.
 
 Fixes: 648a121bafa3 ("wifi: ath12k: ath12k_mac_op_tx(): MLO support")
 Signed-off-by: Akshay Kakatkar <me@kakatkarakshay.dev>
 ---
- drivers/net/wireless/ath/ath12k/wifi7/hw.c | 5 +++++
- 1 file changed, 5 insertions(+)
+ drivers/net/wireless/ath/ath12k/wifi7/hw.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
 
 --- a/drivers/net/wireless/ath/ath12k/wifi7/hw.c
 +++ b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
-@@ -921,7 +921,12 @@ static void ath12k_wifi7_mac_op_tx(struc
+@@ -921,7 +921,14 @@ static void ath12k_wifi7_mac_op_tx(struc
  	}
  
  	/* handle only for MLO case, use deflink for non MLO case */
  	if (ieee80211_vif_is_mld(vif)) {
-+		links_map = vif->active_links & ahvif->links_map;
-+		if (link_id == ATH12K_DEFAULT_LINK_ID &&
++		links_map = vif->valid_links & ahvif->links_map;
++		if (!sta &&
++		    (info_flags & IEEE80211_TX_CTL_HW_80211_ENCAP) &&
++		    link_id == ATH12K_DEFAULT_LINK_ID &&
 +		    !(vif->valid_links & BIT(link_id)) && links_map)
 +			link_id = __ffs(links_map);
 +
